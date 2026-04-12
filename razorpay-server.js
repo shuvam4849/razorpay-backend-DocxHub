@@ -27,6 +27,31 @@ const PLAN_IDS = {
     premium: process.env.PLAN_ID_PREMIUM
 };
 
+// ========== CURRENCY CONFIGURATION ==========
+// Supported currencies with their symbols and conversion rates (1 INR = ?)
+const SUPPORTED_CURRENCIES = {
+    INR: { code: 'INR', symbol: '₹', rate: 1 },
+    USD: { code: 'USD', symbol: '$', rate: 0.012 },
+    GBP: { code: 'GBP', symbol: '£', rate: 0.0095 },
+    EUR: { code: 'EUR', symbol: '€', rate: 0.011 },
+    AUD: { code: 'AUD', symbol: 'A$', rate: 0.018 },
+    CAD: { code: 'CAD', symbol: 'C$', rate: 0.016 },
+    SGD: { code: 'SGD', symbol: 'S$', rate: 0.016 },
+    AED: { code: 'AED', symbol: 'د.إ', rate: 0.044 }
+};
+
+// Function to validate and get currency
+function getValidCurrency(currency) {
+    return SUPPORTED_CURRENCIES[currency] ? currency : 'INR';
+}
+
+// Function to convert amount from INR to target currency
+function convertAmount(amountINR, targetCurrency) {
+    if (targetCurrency === 'INR') return amountINR;
+    const rate = SUPPORTED_CURRENCIES[targetCurrency]?.rate || 1;
+    return (amountINR * rate).toFixed(2);
+}
+
 // Initialize Razorpay
 const razorpay = new Razorpay({
     key_id: RAZORPAY_KEY_ID,
@@ -36,6 +61,7 @@ const razorpay = new Razorpay({
 console.log('🔑 Razorpay initialized with Key ID:', RAZORPAY_KEY_ID);
 console.log('📦 Product IDs loaded:', PRODUCT_IDS);
 console.log('📦 Plan IDs loaded:', PLAN_IDS);
+console.log('💱 Supported currencies:', Object.keys(SUPPORTED_CURRENCIES).join(', '));
 
 // Store customer IDs in memory (use database in production)
 const customerCache = new Map();
@@ -45,6 +71,7 @@ app.get('/api/health', (req, res) => {
     res.json({ 
         status: 'ok', 
         razorpay_key_set: !!RAZORPAY_KEY_ID,
+        supported_currencies: Object.keys(SUPPORTED_CURRENCIES),
         message: 'Server is running'
     });
 });
@@ -63,17 +90,25 @@ app.post('/api/create-credit-order', async (req, res) => {
     try {
         console.log('📦 Create credit order request:', req.body);
         
-        const { productKey, credits, amount, userId, email, name } = req.body;
+        const { productKey, credits, amount, userId, email, name, currency = 'INR' } = req.body;
         
-        // amount is already in rupees from frontend (e.g., 399, 799, 1199, 2499)
-        // Convert to paise (1 Rupee = 100 paise)
-        const amountInPaise = amount * 100;
+        // Validate and get currency
+        const validCurrency = getValidCurrency(currency);
         
-        console.log(`💰 Amount: ₹${amount} (${amountInPaise} paise)`);
+        // amount is in INR from frontend, convert if needed
+        let amountInCurrency = amount;
+        if (validCurrency !== 'INR') {
+            amountInCurrency = convertAmount(amount, validCurrency);
+        }
+        
+        // Convert to smallest unit (paise for INR, cents for others)
+        const amountInSmallestUnit = Math.round(amountInCurrency * 100);
+        
+        console.log(`💰 Amount: ${amount} INR → ${amountInCurrency} ${validCurrency} (${amountInSmallestUnit} ${validCurrency === 'INR' ? 'paise' : 'cents'})`);
         
         const options = {
-            amount: amountInPaise,
-            currency: 'INR',
+            amount: amountInSmallestUnit,
+            currency: validCurrency,
             receipt: `credit_${credits}_${Date.now()}`,
             notes: {
                 userId: userId,
@@ -82,7 +117,9 @@ app.post('/api/create-credit-order', async (req, res) => {
                 type: 'one_time_credit_package',
                 email: email || '',
                 name: name || '',
-                platform: 'DocxHub'
+                platform: 'DocxHub',
+                originalCurrency: 'INR',
+                originalAmount: String(amount)
             }
         };
         
@@ -109,16 +146,17 @@ app.post('/api/create-credit-order', async (req, res) => {
     }
 });
 
-// ========== CREATE SUBSCRIPTION ORDER (FIXED) ==========
+// ========== CREATE SUBSCRIPTION ORDER ==========
 app.post('/api/create-subscription-order', async (req, res) => {
     try {
         console.log('📦 Create subscription request:', req.body);
         
-        const { plan, credits, amount, userId, email, name } = req.body;
+        const { plan, credits, amount, userId, email, name, currency = 'INR' } = req.body;
         
         const planId = plan === 'pro' ? PLAN_IDS.pro : PLAN_IDS.premium;
         
         console.log('📝 Using Plan ID:', planId);
+        console.log('💰 Currency requested:', currency);
         
         // Try to find existing customer first
         let customerId = customerCache.get(userId);
@@ -173,17 +211,19 @@ app.post('/api/create-subscription-order', async (req, res) => {
             }
         }
         
-        // FIXED: Use total_count = 12 (12 months) or 24 (2 years)
-        // Do NOT use 999 as it causes UPI expiry error
+        // Note: Razorpay subscriptions are created in INR only
+        // The currency parameter is stored in notes for reference
         const subscription = await razorpay.subscriptions.create({
             plan_id: planId,
             customer_id: customerId,
-            total_count: 12,  // Changed from 999 to 12 (1 year subscription)
+            total_count: 12,
             quantity: 1,
             notes: {
                 userId: userId,
                 plan: plan,
-                creditsPerMonth: String(credits)
+                creditsPerMonth: String(credits),
+                displayCurrency: currency,
+                originalAmountINR: String(amount)
             }
         });
         
@@ -237,6 +277,24 @@ app.post('/api/verify-payment', async (req, res) => {
     }
 });
 
+// ========== GET EXCHANGE RATES (NEW ENDPOINT) ==========
+app.get('/api/exchange-rates', (req, res) => {
+    const rates = {};
+    for (const [code, config] of Object.entries(SUPPORTED_CURRENCIES)) {
+        rates[code] = {
+            code: config.code,
+            symbol: config.symbol,
+            rate: config.rate
+        };
+    }
+    res.json({ 
+        success: true, 
+        base: 'INR',
+        rates: rates,
+        supportedCurrencies: Object.keys(SUPPORTED_CURRENCIES)
+    });
+});
+
 // ========== TEST ENDPOINT ==========
 app.post('/api/test', (req, res) => {
     console.log('Test endpoint hit:', req.body);
@@ -252,4 +310,5 @@ app.listen(PORT, () => {
     console.log(`🔐 Razorpay Secret: ${RAZORPAY_KEY_SECRET ? 'Set ✅' : 'Missing ❌'}`);
     console.log(`📦 Pro Plan ID: ${PLAN_IDS.pro}`);
     console.log(`📦 Premium Plan ID: ${PLAN_IDS.premium}`);
+    console.log(`💱 Supported Currencies: ${Object.keys(SUPPORTED_CURRENCIES).join(', ')}`);
 });
