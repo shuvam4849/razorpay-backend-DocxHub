@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: docxhub-payment-api
+    env: node
+    buildCommand: npm install
+    startCommand: node razorpay-server.js
+    envVars:
+      - key: RAZORPAY_KEY_ID
+        sync: false
+      - key: RAZORPAY_KEY_SECRET
+        sync: false
+      - key: PLAN_ID_PRO
+        sync: false
+      - key: PLAN_ID_PREMIUM
+        sync: false
