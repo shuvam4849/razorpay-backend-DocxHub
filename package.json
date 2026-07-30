@@ -5,17 +5,17 @@
   "main": "razorpay-server.js",
   "scripts": {
     "start": "node razorpay-server.js",
-    "dev": "nodemon razorpay-server.js",
-    "postinstall": "npx puppeteer browsers install chrome"
+    "dev": "nodemon razorpay-server.js"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^149.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "express-rate-limit": "^8.6.1",
     "firebase-admin": "^14.2.0",
     "multer": "^2.2.0",
-    "puppeteer": "^25.4.0",
+    "puppeteer-core": "^25.4.0",
     "razorpay": "^2.9.0"
   },
   "devDependencies": {
