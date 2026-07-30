@@ -5,7 +5,8 @@
   "main": "razorpay-server.js",
   "scripts": {
     "start": "node razorpay-server.js",
-    "dev": "nodemon razorpay-server.js"
+    "dev": "nodemon razorpay-server.js",
+    "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
     "cors": "^2.8.5",
