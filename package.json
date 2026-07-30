@@ -8,10 +8,13 @@
     "dev": "nodemon razorpay-server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "razorpay": "^2.9.0",
     "cors": "^2.8.5",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "firebase-admin": "^14.2.0",
+    "form-data": "^4.0.6",
+    "multer": "^2.2.0",
+    "razorpay": "^2.9.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"

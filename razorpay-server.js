@@ -4,6 +4,9 @@ const express = require('express');
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const cors = require('cors');
+const multer = require('multer');
+const FormData = require('form-data');
+const admin = require('firebase-admin');
 
 const app = express();
 app.use(cors());
@@ -12,6 +15,7 @@ app.use(express.json());
 // ========== LOAD FROM .env ==========
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
+const CONVERTAPI_TOKEN = process.env.CONVERTAPI_TOKEN;
 
 // Product IDs for one-time credit packages
 const PRODUCT_IDS = {
@@ -62,6 +66,53 @@ console.log('🔑 Razorpay initialized with Key ID:', RAZORPAY_KEY_ID);
 console.log('📦 Product IDs loaded:', PRODUCT_IDS);
 console.log('📦 Plan IDs loaded:', PLAN_IDS);
 console.log('💱 Supported currencies:', Object.keys(SUPPORTED_CURRENCIES).join(', '));
+console.log('🔄 ConvertAPI Token:', CONVERTAPI_TOKEN ? 'Set ✅' : 'Missing ❌');
+
+// Initialize Firebase Admin (used to verify user ID tokens on protected routes)
+admin.initializeApp({
+    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+});
+
+// ========== AUTH MIDDLEWARE ==========
+// Verifies the Firebase ID token sent by the frontend in the Authorization header
+async function requireAuth(req, res, next) {
+    const authHeader = req.headers.authorization || '';
+    const idToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+    if (!idToken) return res.status(401).json({ success: false, error: 'Not logged in' });
+
+    try {
+        req.user = await admin.auth().verifyIdToken(idToken);
+        next();
+    } catch (e) {
+        console.error('❌ Token verification failed:', e.message);
+        res.status(401).json({ success: false, error: 'Invalid or expired session' });
+    }
+}
+
+// ========== CREDIT CHECK MIDDLEWARE ==========
+// Atomically checks and deducts one credit server-side so it can't be bypassed
+async function requireAndDeductCredit(req, res, next) {
+    const userRef = admin.firestore().collection('users').doc(req.user.uid);
+    try {
+        const remaining = await admin.firestore().runTransaction(async (t) => {
+            const doc = await t.get(userRef);
+            const credits = doc.data()?.credits ?? 5;
+            if (credits <= 0) throw new Error('NO_CREDITS');
+            t.update(userRef, { credits: credits - 1, lastCreditUsed: admin.firestore.FieldValue.serverTimestamp() });
+            return credits - 1;
+        });
+        req.remainingCredits = remaining;
+        next();
+    } catch (e) {
+        if (e.message === 'NO_CREDITS') {
+            return res.status(402).json({ success: false, error: 'No credits remaining', requiresUpgrade: true });
+        }
+        console.error('❌ Credit check failed:', e.message);
+        res.status(500).json({ success: false, error: 'Credit check failed' });
+    }
+}
+
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 // Store customer IDs in memory (use database in production)
 const customerCache = new Map();
@@ -295,6 +346,52 @@ app.get('/api/exchange-rates', (req, res) => {
     });
 });
 
+// ========== FILE CONVERSION (PROXIES CONVERTAPI — TOKEN NEVER LEAVES THE SERVER) ==========
+app.post('/api/convert', requireAuth, requireAndDeductCredit, upload.single('file'), async (req, res) => {
+    try {
+        const { from, to } = req.body; // e.g. from=pdf, to=docx
+        if (!req.file || !from || !to) {
+            return res.status(400).json({ success: false, error: 'Missing file, from, or to' });
+        }
+
+        console.log(`🔄 Converting ${req.file.originalname}: ${from} → ${to} for user ${req.user.uid}`);
+
+        const form = new FormData();
+        form.append('File', req.file.buffer, req.file.originalname);
+        form.append('StoreFile', 'true');
+        if (req.body.ocr === 'true') {
+            form.append('Ocr', 'true');
+            form.append('OcrLanguage', 'eng');
+        }
+
+        const convertUrl = `https://v2.convertapi.com/convert/${from}/to/${to}?download=attachment`;
+
+        const response = await fetch(convertUrl, {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${CONVERTAPI_TOKEN}`, ...form.getHeaders() },
+            body: form
+        });
+
+        if (!response.ok) {
+            const errText = await response.text();
+            console.error('❌ ConvertAPI error:', errText);
+            return res.status(response.status).json({ success: false, error: 'Conversion failed' });
+        }
+
+        console.log('✅ Conversion complete:', req.file.originalname);
+
+        res.set('Content-Type', response.headers.get('content-type'));
+        res.set('Content-Disposition', response.headers.get('content-disposition') || `attachment; filename=converted.${to}`);
+        res.set('X-Remaining-Credits', req.remainingCredits);
+        const buffer = Buffer.from(await response.arrayBuffer());
+        res.send(buffer);
+
+    } catch (error) {
+        console.error('❌ Conversion error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 // ========== TEST ENDPOINT ==========
 app.post('/api/test', (req, res) => {
     console.log('Test endpoint hit:', req.body);
@@ -311,4 +408,5 @@ app.listen(PORT, () => {
     console.log(`📦 Pro Plan ID: ${PLAN_IDS.pro}`);
     console.log(`📦 Premium Plan ID: ${PLAN_IDS.premium}`);
     console.log(`💱 Supported Currencies: ${Object.keys(SUPPORTED_CURRENCIES).join(', ')}`);
+    console.log(`🔄 ConvertAPI Token: ${CONVERTAPI_TOKEN ? 'Set ✅' : 'Missing ❌'}`);
 });
