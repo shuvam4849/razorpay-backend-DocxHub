@@ -5,13 +5,14 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const cors = require('cors');
 const multer = require('multer');
+const puppeteer = require('puppeteer');
 const { initializeApp, cert } = require('firebase-admin/app');
 const { getAuth } = require('firebase-admin/auth');
 const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // ========== LOAD FROM .env ==========
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
@@ -116,6 +117,115 @@ async function requireAndDeductCredit(req, res, next) {
 }
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+
+// ========== RESUME TEMPLATE CREDIT CHECK ==========
+// Mirrors the free/paid template list from template-selector.html, but enforced
+// server-side — the frontend's own credit deduction can be skipped by a user
+// who calls this endpoint directly, so this is the real gate.
+const FREE_TEMPLATES = new Set(['tech-modern', 'corporate-blue', 'academic']);
+const TEMPLATE_COST = 5;
+
+async function requireCreditsForTemplate(req, res, next) {
+    const { templateId } = req.body;
+    if (!templateId) return res.status(400).json({ success: false, error: 'Missing templateId' });
+
+    const userRef = firestore.collection('users').doc(req.user.uid);
+    try {
+        const remaining = await firestore.runTransaction(async (t) => {
+            const doc = await t.get(userRef);
+            const data = doc.data() || {};
+            const isPro = data.subscription?.status === 'active' && data.subscription?.plan === 'pro';
+            const cost = (FREE_TEMPLATES.has(templateId) || isPro) ? 0 : TEMPLATE_COST;
+            const credits = data.credits ?? 5;
+
+            if (cost === 0) return credits;
+            if (credits < cost) throw new Error('NO_CREDITS');
+
+            t.update(userRef, { credits: credits - cost, lastCreditUsed: FieldValue.serverTimestamp() });
+            return credits - cost;
+        });
+        req.remainingCredits = remaining;
+        next();
+    } catch (e) {
+        if (e.message === 'NO_CREDITS') {
+            return res.status(402).json({ success: false, error: `This template requires ${TEMPLATE_COST} credits`, requiresUpgrade: true });
+        }
+        console.error('❌ Template credit check failed:', e.message);
+        res.status(500).json({ success: false, error: 'Credit check failed' });
+    }
+}
+
+// Strip anything unsafe out of a user-supplied filename before it hits a header
+function sanitizeFilename(name) {
+    const cleaned = (name || 'resume').replace(/[^a-zA-Z0-9_\-]/g, '_');
+    return `${cleaned.slice(0, 100)}.pdf`;
+}
+
+// ========== RESUME PDF GENERATION (PUPPETEER) ==========
+app.post('/api/generate-pdf', requireAuth, requireCreditsForTemplate, async (req, res) => {
+    let browser = null;
+    try {
+        const { html, css } = req.body;
+        const filename = sanitizeFilename(req.body.filename);
+
+        if (!html || html.trim() === '') {
+            return res.status(400).json({ success: false, error: 'No HTML content provided' });
+        }
+
+        console.log(`📄 Generating PDF (${filename}) for user ${req.user.uid} — HTML: ${html.length} chars, CSS: ${(css || '').length} chars`);
+
+        browser = await puppeteer.launch({
+            headless: 'new',
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        });
+
+        const page = await browser.newPage();
+
+        const fullHTML = `
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+                <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+                <style>
+                    * { margin: 0; padding: 0; box-sizing: border-box; }
+                    body { margin: 0; padding: 20px; background: white; font-family: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif; }
+                    ${css || ''}
+                </style>
+            </head>
+            <body>${html}</body>
+            </html>
+        `;
+
+        await page.setContent(fullHTML, { waitUntil: ['networkidle0', 'load', 'domcontentloaded'], timeout: 30000 });
+        await page.evaluateHandle('document.fonts.ready');
+        await new Promise(resolve => setTimeout(resolve, 500));
+
+        const pdf = await page.pdf({
+            format: 'A4',
+            printBackground: true,
+            margin: { top: '15mm', right: '15mm', bottom: '15mm', left: '15mm' },
+            displayHeaderFooter: false,
+            preferCSSPageSize: true,
+            scale: 1
+        });
+
+        console.log('✅ PDF generated:', pdf.length, 'bytes');
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('X-Remaining-Credits', req.remainingCredits);
+        res.send(pdf);
+
+    } catch (error) {
+        console.error('❌ PDF Generation Error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    } finally {
+        if (browser) await browser.close();
+    }
+});
 
 // Store customer IDs in memory (use database in production)
 const customerCache = new Map();
