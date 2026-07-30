@@ -5,8 +5,9 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const cors = require('cors');
 const multer = require('multer');
-const FormData = require('form-data');
-const admin = require('firebase-admin');
+const { initializeApp, cert } = require('firebase-admin/app');
+const { getAuth } = require('firebase-admin/auth');
+const { getFirestore, FieldValue } = require('firebase-admin/firestore');
 
 const app = express();
 app.use(cors());
@@ -69,9 +70,11 @@ console.log('💱 Supported currencies:', Object.keys(SUPPORTED_CURRENCIES).join
 console.log('🔄 ConvertAPI Token:', CONVERTAPI_TOKEN ? 'Set ✅' : 'Missing ❌');
 
 // Initialize Firebase Admin (used to verify user ID tokens on protected routes)
-admin.initializeApp({
-    credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+const firebaseApp = initializeApp({
+    credential: cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
 });
+const auth = getAuth(firebaseApp);
+const firestore = getFirestore(firebaseApp);
 
 // ========== AUTH MIDDLEWARE ==========
 // Verifies the Firebase ID token sent by the frontend in the Authorization header
@@ -81,7 +84,7 @@ async function requireAuth(req, res, next) {
     if (!idToken) return res.status(401).json({ success: false, error: 'Not logged in' });
 
     try {
-        req.user = await admin.auth().verifyIdToken(idToken);
+        req.user = await auth.verifyIdToken(idToken);
         next();
     } catch (e) {
         console.error('❌ Token verification failed:', e.message);
@@ -92,13 +95,13 @@ async function requireAuth(req, res, next) {
 // ========== CREDIT CHECK MIDDLEWARE ==========
 // Atomically checks and deducts one credit server-side so it can't be bypassed
 async function requireAndDeductCredit(req, res, next) {
-    const userRef = admin.firestore().collection('users').doc(req.user.uid);
+    const userRef = firestore.collection('users').doc(req.user.uid);
     try {
-        const remaining = await admin.firestore().runTransaction(async (t) => {
+        const remaining = await firestore.runTransaction(async (t) => {
             const doc = await t.get(userRef);
             const credits = doc.data()?.credits ?? 5;
             if (credits <= 0) throw new Error('NO_CREDITS');
-            t.update(userRef, { credits: credits - 1, lastCreditUsed: admin.firestore.FieldValue.serverTimestamp() });
+            t.update(userRef, { credits: credits - 1, lastCreditUsed: FieldValue.serverTimestamp() });
             return credits - 1;
         });
         req.remainingCredits = remaining;
@@ -357,7 +360,7 @@ app.post('/api/convert', requireAuth, requireAndDeductCredit, upload.single('fil
         console.log(`🔄 Converting ${req.file.originalname}: ${from} → ${to} for user ${req.user.uid}`);
 
         const form = new FormData();
-        form.append('File', req.file.buffer, req.file.originalname);
+        form.append('File', new Blob([req.file.buffer]), req.file.originalname);
         form.append('StoreFile', 'true');
         if (req.body.ocr === 'true') {
             form.append('Ocr', 'true');
@@ -368,7 +371,7 @@ app.post('/api/convert', requireAuth, requireAndDeductCredit, upload.single('fil
 
         const response = await fetch(convertUrl, {
             method: 'POST',
-            headers: { Authorization: `Bearer ${CONVERTAPI_TOKEN}`, ...form.getHeaders() },
+            headers: { Authorization: `Bearer ${CONVERTAPI_TOKEN}` },
             body: form
         });
 
